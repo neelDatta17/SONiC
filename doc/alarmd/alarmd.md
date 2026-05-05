@@ -26,14 +26,12 @@
    - 7.11 [Shorthand Syntax](#711-shorthand-syntax)
    - 7.12 [Config Validation](#712-config-validation)
    - 7.13 [Hard Limits](#713-hard-limits)
-   - 7.14 [Signal Handling](#714-signal-handling)
-   - 7.15 [Logging and Serviceability](#715-logging-and-serviceability)
-   - 7.16 [Sequence Diagrams](#716-sequence-diagrams)
-   - 7.17 [DB and Schema Changes](#717-db-and-schema-changes)
-   - 7.18 [Linux Dependencies](#718-linux-dependencies)
-   - 7.19 [Docker Dependency](#719-docker-dependency)
-   - 7.20 [Build Dependency](#720-build-dependency)
-   - 7.21 [Platform Dependencies](#721-platform-dependencies)
+   - 7.14 [Sequence Diagrams](#714-sequence-diagrams)
+   - 7.15 [DB and Schema Changes](#715-db-and-schema-changes)
+   - 7.16 [Linux Dependencies](#716-linux-dependencies)
+   - 7.17 [Docker Dependency](#717-docker-dependency)
+   - 7.18 [Build Dependency](#718-build-dependency)
+   - 7.19 [Platform Dependencies](#719-platform-dependencies)
 8. [SAI API](#sai-api)
 9. [Configuration and Management](#configuration-and-management)
    - 9.1 [CLI Enhancements — show alarms](#91-cli-enhancements--show-alarms)
@@ -92,11 +90,10 @@ The scope covers:
 | SYSTEM_ALARMS | The STATE_DB table where alarmd writes alarm entries |
 | alarm_id | A string identifier for an alarm type (e.g. `PSU_MISSING`, `FAN_FAULT`) |
 | object_name | The specific instance an alarm applies to (e.g. `PSU 1`, `FAN 3`, `Ethernet4`) |
-| alarm_defs | JSON files that declare which STATE_DB fields or scripts to monitor and under what conditions to raise alarms |
-| common catalog | A built-in JSON file shipped with the `sonic_alarm` package containing standard SONiC alarm definitions applicable to most platforms |
+| alarm_defs | The `alarm_defs.json` file(s) that declare which STATE_DB fields or scripts to monitor and under what conditions to raise alarms |
+| common catalog | The built-in `common_alarm_defs.json` file shipped with the `sonic_alarm` package, containing standard SONiC alarm definitions applicable to most platforms |
 | merge | The mechanism where alarmd loads the common catalog as a baseline, then the per-platform `alarm_defs.json` adds or replaces tables and checks on top of it. Same `table_name` + `check_name` = platform wins. An optional `disable` list suppresses unwanted common checks. |
 | shorthand | A compact single-line notation for alarm checks: `[alarm_id, "field op value", severity]` |
-| swsscommon | The SONiC C++/Python library for Redis database access (DBConnector, Table, etc.) |
 
 ---
 
@@ -108,16 +105,18 @@ FAN_INFO, TEMPERATURE_INFO, etc.). However, there is no
 single daemon that evaluates this data against fault thresholds and presents a
 unified alarm view.
 
-alarmd fills this gap. It is a pure consumer of STATE_DB: it reads the data
-that existing daemons already publish, evaluates conditions defined in JSON
-alarm definition files, and writes alarm state to a single `SYSTEM_ALARMS`
-table. No existing daemon requires modification.
+alarmd fills this gap. It has two detection mechanisms:
 
-Additionally, alarmd can execute external scripts for any condition that is
-not represented in or calculable from STATE_DB. Any executable that exits 0
-(healthy) or non-zero (fault) can be used as an alarm source -- whether that
-is a monit-style system resource check (as system-health uses), or any custom
-script a developer chooses to add.
+1. **STATE_DB polling** — alarmd reads the data that existing daemons already
+   publish, evaluates conditions defined in JSON alarm definition files, and
+   writes alarm state to a single `SYSTEM_ALARMS` table. No existing daemon
+   requires modification.
+
+2. **Script execution** — for conditions not represented in STATE_DB, alarmd
+   can execute external health-check scripts. Any executable that exits 0
+   (healthy) or non-zero (fault) can be used as an alarm source — whether
+   that is a system resource check (CPU, memory, disk) or any custom script
+   a platform vendor chooses to add.
 
 The alarm definition files are static platform configuration, stored in the
 device directory (`/usr/share/sonic/device/<platform>/`) and installed at
@@ -156,13 +155,18 @@ platforms, to platform-specific PSU and thermal monitoring, to system-level reso
 
 #### 1. Standard Hardware Faults — PSU and Fan (common catalog)
 
-Currently, the common alarm catalog (`common_alarm_defs.json`) 
-covers **PSU_INFO** and **FAN_INFO** checks only. These two STATE_DB tables
-are published by the standard pmon daemons (psud, thermalctld) and have
-stable, well-defined field names across all SONiC platforms. Additional
-tables (TEMPERATURE_INFO, etc.) are
-intentionally left out of the common catalog for now — platforms that need
-them can add them in their per-platform `alarm_defs.json`.
+The common alarm catalog (`common_alarm_defs.json`) provides a **minimal
+baseline** that works on every SONiC platform out of the box. It covers
+**PSU_INFO** and **FAN_INFO** only — these tables use standardized
+boolean/presence fields (`presence`, `status`, `is_under_speed`, etc.) that
+psud and thermalctld write identically on all platforms. This makes them
+safe to include as universal defaults.
+
+The common catalog is designed to grow over time as additional STATE_DB
+tables and fields stabilize across the SONiC ecosystem. Platform vendors
+can also extend or override the common catalog by providing a per-platform
+`alarm_defs.json` (see Use Cases 2 and 3 below, and §7.10 for merge
+details).
 
 **Common catalog alarm inventory (PSU_INFO + FAN_INFO):**
 
@@ -183,74 +187,27 @@ These checks use boolean and presence fields that psud and thermalctld write ide
 every platform, so no per-platform overrides are needed for baseline
 coverage.
 
-**Example: PSU_INFO alarm table from the common catalog:**
+**Alarm table structure (template):**
 
 ```json
 {
     "type": "statedb",
-    "table_name": "PSU_INFO",
-    "object_key_pattern": "PSU_INFO|*",
+    "table_name": "<STATE_DB table>",
+    "object_key_pattern": "<table>|*",
     "checks": [
         {
-            "check_name": "psu_presence",
-            "alarm_id": "PSU_MISSING",
-            "severity": "Critical",
-            "category": "Hardware",
-            "description_template": "{object_name} Absent",
-            "condition": {"field": "presence", "operator": "==", "value": "false"}
-        },
-        {
-            "check_name": "power_status",
-            "alarm_id": "PSU_POWER_BAD",
-            "severity": "Critical",
-            "category": "Hardware",
-            "description_template": "{object_name} Power Not OK",
-            "condition": {"field": "status", "operator": "==", "value": "false"}
-        },
-        {
-            "check_name": "voltage_out_of_range",
-            "alarm_id": "PSU_VOLTAGE_OOR",
-            "severity": "Major",
-            "category": "Hardware",
-            "description_template": "{object_name} Voltage Out of Range",
-            "condition": {"field": "voltage_out_of_range", "operator": "==", "value": "True"}
-        },
-        {
-            "check_name": "current_out_of_range",
-            "alarm_id": "PSU_CURRENT_OOR",
-            "severity": "Major",
-            "category": "Hardware",
-            "description_template": "{object_name} Current Out of Range",
-            "condition": {"field": "current_out_of_range", "operator": "==", "value": "True"}
-        },
-        {
-            "check_name": "fan_fault",
-            "alarm_id": "PSU_FAN_FAULT",
-            "severity": "Major",
-            "category": "Hardware",
-            "description_template": "{object_name} Fan Fault",
-            "condition": {"field": "fan_fault", "operator": "==", "value": "True"}
-        },
-        {
-            "check_name": "temperature_fault",
-            "alarm_id": "PSU_TEMP_FAULT",
-            "severity": "Major",
-            "category": "Hardware",
-            "description_template": "{object_name} Temperature Fault",
-            "condition": {"field": "temp_fault", "operator": "==", "value": "True"}
+            "check_name": "<unique name>",
+            "alarm_id": "<ALARM_ID>",
+            "severity": "Critical | Major | Minor | Warning",
+            "category": "Hardware | System",
+            "description_template": "{object_name} <description>",
+            "condition": {"field": "<field>", "operator": "<op>", "value": "<expected>"}
         }
     ]
 }
 ```
 
-> **Sequencing note**: alarmd's `systemd` unit is ordered
-> `After=sonic.target` (`Requires=sonic.target`), so it starts *after* platform
-> daemons have begun populating STATE_DB. If a fault occurs during platform
-> init (before alarmd's first poll), the fault state persists in STATE_DB.
-> alarmd discovers it on its very first poll cycle and raises the alarm
-> immediately. There is no window where a fault can be "missed" due to
-> startup ordering — as long as the fault state is written to STATE_DB,
-> alarmd will find it.
+See §9.2 for the full schema reference.
 
 #### 2. Platform-Specific Statedb Checks (per-platform merge)
 
@@ -289,8 +246,7 @@ checks in the per-platform `alarm_defs.json`:
 
 Because the platform file declares a PSU_INFO table, alarmd merges it with
 the common catalog's PSU_INFO: the common checks (6) plus this platform
-check (1) = 7 total PSU_INFO checks. No `inherits` keyword, no `override`
-block — just declare what you need.
+check (1) = 7 total PSU_INFO checks.
 
 #### 3. Custom Platform Health via Script Checks (per-platform)
 
@@ -306,9 +262,29 @@ mechanism provides a catch-all. Any executable that returns exit code 0
 - **Network conditions**: Default route presence, BGP session count,
   link-local reachability
 
-This extensibility means alarmd is not limited to what existing daemons
-publish to STATE_DB. Any fault that can be detected by a script can be
-integrated into the unified alarm view.
+**Example script check declaration** (in the platform's `alarm_defs.json`):
+
+```json
+{
+    "type": "script",
+    "group_name": "system_resources",
+    "checks": [
+        {
+            "check_name": "disk_usage",
+            "alarm_id": "DISK_USAGE_HIGH",
+            "object_name": "root-partition",
+            "severity": "Major",
+            "category": "System",
+            "description_template": "{object_name} Disk Usage Exceeds Threshold",
+            "command": "/etc/sonic/alarm_scripts/check_disk.sh",
+            "timeout": 10,
+            "condition": {"exit_code": "!=", "value": 0}
+        }
+    ]
+}
+```
+
+See §9.2 for the full script check schema reference.
 
 ---
 
@@ -326,73 +302,17 @@ integrated into the unified alarm view.
 - On startup (including after daemon restart or warmboot), alarmd shall clear all pre-existing `SYSTEM_ALARMS` entries from STATE_DB and rediscover faults on its first poll cycle. This ensures no stale alarms persist across config changes or reboots (see §10).
 - alarmd shall enforce hard limits on the number of statedb checks, script checks, and script timeout to prevent resource exhaustion from misconfigured alarm definitions.
 - alarmd shall support a common alarm catalog with per-platform merge mechanism to minimize per-platform configuration.
-- alarmd shall support a shorthand syntax for concise alarm check declarations.
 - `show alarms` CLI command shall read SYSTEM_ALARMS from STATE_DB and display alarm state. Supports `--summary` for severity counts, `--json` for JSON output, and filter options (`-s`, `-c`, `-o`, `-g`).
 
 ---
 
 ## 6. Architecture Design
 
-alarmd does not change the existing SONiC architecture. It is a new daemon
-that runs alongside existing platform daemons in the pmon container (or as a
-standalone systemd service on the host, depending on deployment preference).
-
-alarmd interacts exclusively with STATE_DB via the standard swsscommon
-library. It reads from tables published by other daemons and writes to its
-own `SYSTEM_ALARMS` table. No new IPC mechanisms, ZMQ channels, or D-Bus
-interfaces are introduced.
+Alarmd reads from tables published by existing daemons and writes to its
+own `SYSTEM_ALARMS` table. It interacts exclusively with 
+STATE_DB via the standard swsscommon library. 
 
 ![alarmd Architecture](alarmd.png)
-
-```
-+-----------------------------------------------------------------------+
-|                          SONiC Host / pmon                             |
-|                                                                       |
-|  +-----------+  +-----------+  +---------+  +---------+   |
-|  |   psud    |  |thermalctld|  |sensormond| | pcied   |   |
-|  +-----+-----+  +-----+-----+  +----+----+  +----+----+  |
-|        |              |              |             |       |
-|        v              v              v             v       |
-|  +--------------------------------------------------------------------+
-|  |                        STATE_DB (6)                                |
-|  |                                                                    |
-|  | PSU_INFO  FAN_INFO  TEMPERATURE_INFO                              |
-|  |   (+ any platform-specific tables)                                |
-|  |                                                                    |
-|  |  +--- SYSTEM_ALARMS (written by alarmd) ----------------------+   |
-|  |  | SYSTEM_ALARMS|PSU_MISSING|PSU 2     status=active          |   |
-|  |  | SYSTEM_ALARMS|FAN_FAULT|FAN 3       status=active          |   |
-|  |  | SYSTEM_ALARMS|CPU_USAGE_HIGH|SYSTEM status=active          |   |
-|  |  +------------------------------------------------------------+   |
-|  +--------------------------------------------------------------------+
-|        |                                          ^                   |
-|        | reads                                    | writes            |
-|  +-----+------------------------------------------+----------------+  |
-|  |     |                   alarmd                                   |  |
-|  |     v                                                            |  |
-|  |  +-----------------+     +------------------+                   |  |
-|  |  | StateDBPoller   |     | ScriptRunner     |                   |  |
-|  |  | poll_interval=3s|     | poll_interval=60s|                   |  |
-|  |  | (any STATE_DB   |     | (any executable  |                   |  |
-|  |  |  table declared |     |  declared in     |                   |  |
-|  |  |  in alarm_defs) |     |  alarm_defs)     |                   |  |
-|  |  |                 |     | (ThreadPool x4)  |                   |  |
-|  |  +--------+--------+     +--------+---------+                   |  |
-|  |           |                       |                             |  |
-|  |           v                       v                             |  |
-|  |  +----------------------------------------+                    |  |
-|  |  |           AlarmStore                    |                    |  |
-|  |  | raise_alarm() / clear_alarm()           |                    |  |
-|  |  | clear_on_startup()                      |                    |  |
-|  |  | _active: set("alarm_id|object_name")    |                    |  |
-|  |  +----------------------------------------+                    |  |
-|  +-----------------------------------------------------------------+  |
-|        ^                                                              |
-|        | reads alarm_defs from disk                                   |
-|  /usr/share/sonic/device/<platform>/alarm_defs.json                   |
-|  /etc/sonic/alarm_scripts/*.sh                                        |
-+-----------------------------------------------------------------------+
-```
 
 ### Data flow summary
 
@@ -410,12 +330,6 @@ interfaces are introduced.
 ## 7. High-Level Design
 
 ### 7.1 Module Overview
-
-alarmd is a built-in SONiC platform daemon, not a SONiC Application Extension.
-It is implemented as a Python package (`sonic_alarm`) with a thin entry-point
-script (`scripts/alarmd`) that subclasses `DaemonBase` from
-`sonic_py_common.daemon_base`, following the same pattern as
-`system-health`/`healthd` and `sonic-platform-daemons`/`psud`.
 
 Package structure:
 
@@ -442,42 +356,15 @@ platform/common/daemons/alarmd/
     alarmd.service
 ```
 
-This follows the same structure as `system-health`/`healthd`:
-a thin DaemonBase-derived entry point, a package of helper modules that
-each own their logging via `SysLogger`, and no centralized `utils.py` for
-logging or DB setup (DaemonBase and `daemon_base.db_connect()` handle that).
+#### Module Roles
 
-Module dependency graph (imports flow downward):
-
-```
-scripts/alarmd  (DaemonBase subclass)
-    -> sonic_py_common.daemon_base      (DaemonBase, db_connect)
-    -> swsscommon.swsscommon            (Table)
-    -> sonic_alarm.constants
-    -> sonic_alarm.config
-    -> sonic_alarm.alarm_store
-    -> sonic_alarm.statedb_poller
-    -> sonic_alarm.script_runner
-
-alarm_store    -> swsscommon (FieldValuePairs), sonic_py_common (SysLogger)
-statedb_poller -> swsscommon (Table), sonic_py_common (SysLogger), alarm_store
-script_runner  -> sonic_py_common (SysLogger), alarm_store, constants
-config         -> constants (uses logging.getLogger — inherits DaemonBase's SysLogHandler)
-```
-
-No circular dependencies. `constants.py` is the sole leaf module.
-
-#### Module Descriptions
-
-| Module | Role | Key contents |
-|--------|------|--------------|
-| **`scripts/alarmd`** | Entry point and main loop. Extends `DaemonBase` from `sonic_py_common`. | `AlarmDaemon(DaemonBase)` class: calls `super().__init__(SYSLOG_IDENTIFIER)` and `self.set_min_log_priority_info()`, acquires PID file lock (`fcntl.flock`), connects to STATE_DB via `daemon_base.db_connect("STATE_DB")`, creates `Table(state_db, SYSTEM_ALARMS_TABLE)`, instantiates AlarmStore / StateDBPoller / ScriptRunner, runs `clear_on_startup()`, then enters two daemon-thread loops — one for statedb polling (`_statedb_loop`) and one for script execution (`_script_loop`). Overrides `signal_handler()` for `SIGHUP` (reload) and `SIGTERM`/`SIGINT` (shutdown). Top-level helpers: `acquire_pidfile_lock()`, `_truncate_checks()`, `main()`. Follows the same pattern as `system-health/healthd` and `sonic-platform-daemons/psud`. |
-| **`constants.py`** | Single source of truth for every magic string, file path, default interval, and hard limit. | `SYSLOG_IDENTIFIER`, `STATE_DB`, `SYSTEM_ALARMS_TABLE`, `MACHINE_CONF`, `DEVICE_BASE`, `ALARM_DEFS_FILENAME`, `COMMON_ALARM_DEFS_FILENAME`, `ALARM_SCRIPTS_DIR`, `SONIC_VERSION_FILE`, `DEFAULT_STATEDB_INTERVAL`, `DEFAULT_SCRIPT_INTERVAL`, `SCRIPT_TIMEOUT`, `MAX_STATEDB_CHECKS`, `MAX_SCRIPT_CHECKS`, `MIN_STATEDB_INTERVAL`, `MIN_SCRIPT_INTERVAL`, `MAX_SCRIPT_TIMEOUT`, `PIDFILE_PATH`, `VALID_SEVERITIES`, `VALID_OPERATORS`. Pure data — no logic, no imports beyond the standard library. |
-| **`config.py`** | Alarm definition loading, merge resolution, shorthand expansion, and semantic validation. Uses `logging.getLogger('alarmd')` at module level — since `DaemonBase`'s `SysLogger` registers under the same `'alarmd'` identifier, config.py inherits the syslog handler automatically (same logger singleton). | `resolve_paths()` — reads `/host/machine.conf` to find the platform directory, then locates `alarm_defs.json`. `load_alarm_defs()` — orchestrates the full pipeline: load platform file → merge with common catalog → expand `checks_short` → `validate()` → `_check_sonic_version()`. `validate(defs)` — enforces required fields, valid operators, valid severities, script existence, hard-limit caps. `_get_running_sonic_version()` — reads the `branch` field from `/etc/sonic/sonic_version.yml` (simple line parsing, no YAML dependency). `_check_sonic_version(defs)` — compares declared `sonic_version` against the running branch and logs a WARNING on mismatch (advisory only, never blocks loading). |
-| **`alarm_store.py`** | Sole writer to the `SYSTEM_ALARMS` STATE_DB table; owns the in-memory active-alarm set. Has its own module-level `SysLogger(log_identifier='alarmd#store')` for syslog output, following the same pattern as `system-health/service_checker.py`. | `AlarmStore` class. Core state: `self._active: set[str]` (each element is `"alarm_id|object_name"`), protected by `threading.Lock`. Constructor takes `(alarm_defs, alarms_table)` — no logger parameter, uses module-level logger. `raise_alarm()` — writes a new alarm to STATE_DB (`status=active`, `time_created=now()`) only if the tag is not already active (idempotent). `clear_alarm()` — **deletes** the STATE_DB key entirely and removes from active set. `clear_on_startup()` — deletes all pre-existing `SYSTEM_ALARMS` keys from STATE_DB and resets in-memory state (warmboot safety). `purge_stale_alarms(valid_ids)` — removes alarms whose `alarm_id` no longer appears in the current config (used during SIGHUP reload). `_rebuild_meta(alarm_defs)` — builds a lookup table mapping each `alarm_id` to its severity, category, source, and description template. `set_alarm()` — convenience dispatcher that calls `raise_alarm` or `clear_alarm` based on a boolean flag. `active_count` (property), `active_tags` (property) — accessors for the in-memory set. `known_alarm_ids()` — returns the set of alarm_ids in the metadata lookup. Direct import: `from swsscommon.swsscommon import FieldValuePairs`. |
-| **`statedb_poller.py`** | Reads STATE_DB tables every poll cycle and evaluates field conditions against alarm definitions. Has its own module-level `SysLogger(log_identifier='alarmd#poller')`. | `StateDBPoller` class: constructed with a list of statedb alarm tables, an `AlarmStore` reference, and a `DBConnector`. `poll()` — iterates every table → creates `Table(db, table_name)` → `getKeys()` → for each key, for each check: `get(field)` → `evaluate_condition()` → `raise_alarm()` or `clear_alarm()` (with OR-logic aggregation). Direct import: `from swsscommon.swsscommon import Table`. `evaluate_condition(field_value, operator, expected)` — module-level function: handles missing fields (→ false), case-sensitive string equality (`==`, `!=`), and numeric relational comparison (`<`, `>`, `<=`, `>=`) with automatic `float()` conversion and string fallback. |
-| **`script_runner.py`** | Executes external health-check scripts via a `ThreadPoolExecutor(max_workers=4)`. Has its own module-level `SysLogger(log_identifier='alarmd#runner')`. | `ScriptRunner` class: constructed with script group definitions, an `AlarmStore`, and a worker count. `_snapshot_mtimes()` — records the baseline mtime of every script path at construction time (reset on SIGHUP rebuild). `run_all()` — submits due checks as futures, collects results, calls `raise_alarm`/`clear_alarm`. `_run_check(check)` — compares current mtime against baseline (logs WARNING if modified, still executes), calls `subprocess.run(command, timeout=…, capture_output=True)`, handles `TimeoutExpired` (SIGKILL + treat as fault). `_evaluate_script_condition(condition, exit_code, stdout)` — static method: compares exit code against the declared condition (`!= 0`, `== 0`, etc.). |
-| **`common_alarm_defs.json`** | Shipped inside the `sonic_alarm` package. Contains the v1.0 common alarm catalog: **PSU_INFO and FAN_INFO checks only** (10 checks total). Per-platform files are merged on top of it — platform `alarm_tables` add or replace checks and tables. | Not a Python module — loaded at runtime by `config.py` during the merge step. |
+- **`scripts/alarmd`** — Entry point. Subclasses `DaemonBase`, acquires PID lock, connects to STATE_DB, instantiates the components below, runs `clear_on_startup()`, then enters the main polling loop. Handles `SIGHUP` (reload) and `SIGTERM` (shutdown).
+- **`constants.py`** — All magic strings, file paths, default intervals, and hard limits. Pure data, no logic.
+- **`config.py`** — Loads alarm definitions from disk, merges with common catalog, expands shorthand, validates, and checks `sonic_version` compatibility.
+- **`alarm_store.py`** — Sole writer to `SYSTEM_ALARMS` in STATE_DB. Maintains a thread-safe in-memory active-alarm set. Provides `raise_alarm()`, `clear_alarm()`, `clear_on_startup()`, and `purge_stale_alarms()`.
+- **`statedb_poller.py`** — Reads STATE_DB tables each poll cycle, evaluates field conditions via `evaluate_condition()`, and calls AlarmStore to raise or clear alarms (with OR-logic aggregation).
+- **`script_runner.py`** — Executes health-check scripts via `ThreadPoolExecutor(max_workers=4)`. Handles timeouts (SIGKILL), mtime modification detection, and exit-code evaluation.
+- **`common_alarm_defs.json`** — The built-in common alarm catalog (PSU_INFO + FAN_INFO, 10 checks). Loaded at runtime by `config.py` during the merge step.
 
 ### 7.2 Repositories Changed
 
@@ -487,8 +374,6 @@ No circular dependencies. `constants.py` is the sole leaf module.
 | `sonic-buildimage` (device directory) | Per-platform: `device/<platform>/alarm_defs.json` and `alarm_scripts/*.sh`. |
 | `sonic-utilities` | New `show` CLI: `show alarms` (with `--summary`, `--json`, filter, and grouping options) in `show/alarms.py`. |
 
-No changes to: sonic-swss, sonic-sairedis, sonic-platform-common,
-sonic-platform-daemons (other daemons), or any SAI implementation.
 
 ### 7.3 StateDB Polling
 
@@ -511,6 +396,15 @@ For each alarm table of type `statedb` in the loaded alarm definitions:
 
 The poll runs on every main-loop iteration. The main loop sleeps for
 `statedb_poll_interval` seconds (default 3) between iterations.
+
+**Configuring the poll interval**: The statedb poll interval is set via the
+`alarmd_settings.statedb_poll_interval` field in the platform's
+`alarm_defs.json` (see §9.2 for schema). The default is 3 seconds, chosen
+to balance detection latency against Redis overhead (0.30% CPU at production
+load). alarmd enforces a floor of 2 seconds (`MIN_STATEDB_INTERVAL` in
+`constants.py`) to prevent busy-loop thrashing. If a value below the floor
+is specified, it is silently clamped to the floor. See §7.13 for the full
+hard-limits table and the scalability evidence behind these values.
 
 alarmd can poll **any** STATE_DB table published by **any** SONiC daemon.
 The tables to poll are declared entirely in the alarm definition files — not
@@ -543,7 +437,9 @@ For each alarm table of type `script` in the loaded alarm definitions:
 6. Scripts that exceed their timeout are killed (SIGKILL) and treated as faults.
 
 Script paths are absolute. alarmd does not search PATH. Scripts must be
-executable and owned by root.
+executable and owned by root. Scripts live in
+`/etc/sonic/alarm_scripts/` on the host filesystem (installed at build time
+from the platform's `device/<platform>/alarm_scripts/` directory).
 
 Like statedb checks, the scripts to execute are declared entirely in alarm
 definition files. Any executable that exits 0 (healthy) or non-zero (fault)
@@ -564,6 +460,20 @@ Platform vendors may add **any custom script** as an alarm check (e.g., a
 script that checks platform initialization state, FPGA health, I2C bus
 health, or watchdog status) simply by declaring it in the alarm
 definition files.
+
+**Configuring script execution parameters**:
+
+| Parameter | Where to set | Default | Allowed range | Rationale |
+|-----------|-------------|---------|---------------|-----------|
+| `script_poll_interval` | `alarmd_settings` in `alarm_defs.json` | 60s | ≥ 30s (floor: `MIN_SCRIPT_INTERVAL`) | Scripts are I/O-bound (subprocess fork); 60s avoids subprocess storms while keeping detection timely. |
+| Per-check `interval` | `interval` field on individual script checks | Inherits global | ≥ 30s | Allows high-priority scripts (e.g. container health) to run more often than low-priority ones. |
+| Per-check `timeout` | `timeout` field on individual script checks | 10s (`SCRIPT_TIMEOUT`) | ≤ 30s (ceiling: `MAX_SCRIPT_TIMEOUT`) | Scripts exceeding the ceiling are clamped; scripts exceeding their timeout at runtime are killed via SIGKILL. |
+| `max_workers` | Hard-coded in `constants.py` (not user-configurable) | 4 | — | Bounds concurrent subprocesses. 4 threads handle 50 scripts comfortably (0.35% CPU). Not exposed in `alarm_defs.json` because increasing it risks fork storms. |
+
+All intervals and timeouts are validated at config load time. Values below
+the floor are clamped up; values above the ceiling are clamped down. See
+§7.13 for the complete hard-limits table with scalability evidence, and §9.2
+for the full `alarm_defs.json` schema.
 
 ### 7.5 Alarm Store
 
@@ -599,27 +509,8 @@ Methods:
 
 ### 7.6 Alarm Lifecycle
 
-```
-                                        condition=True
-                                       (already active,
-                                        no-op / no write)
-                                       +-----+
-                                       |     |
-                                       v     |
-    +--------+  condition=True  +------+-----+--+  condition=False  +--------+
-    |   No   |    (raise)       |    Active      |    (clear)       | Cleared|
-    |  Alarm |----------------->|   (STATE_DB)   |----------------->|        |
-    +--------+                  +----------------+                  +--------+
-        ^                                                               |
-        |  condition=False                              condition=True  |
-        |  (no-op, already                              (raise again)   |
-        |   no alarm)                                                   |
-        +<------+                                            +--------->+
-                |                                            |
-                +--+                                    +----+
-                   |        startup gc                  |
-                   +------------------------------------+
-```
+![Alarm Lifecycle State Machine](alarm_lifecycle.png)
+
 
 States:
 
@@ -643,26 +534,47 @@ States:
 
 ### 7.7 Condition Evaluation
 
-`evaluate_condition(field_value, operator, expected)` compares a STATE_DB
-field value (string) against an expected value (string from alarm_defs JSON).
+`evaluate_condition(field_value, operator, expected)` is a module-level
+function in `statedb_poller.py` that compares a single STATE_DB field value
+against an expected value declared in the alarm definition. Both sides are
+strings (STATE_DB stores everything as strings); the function returns a
+boolean indicating whether the fault condition is met.
 
-Logic:
+The function is designed to be **fail-safe**: any ambiguous or error case
+returns `False` (no alarm raised), because a false positive (spurious alarm)
+is worse than a brief detection delay.
 
-1. **Missing field**: If the field does not exist in STATE_DB (daemon has not
-   yet populated it), the condition evaluates to false. No alarm is raised.
-   This prevents spurious alarms during daemon startup.
+#### Missing field or missing key
 
-2. **Equality operators** (`==`, `!=`): Direct string comparison.
-   - Example: `presence == "false"` -- STATE_DB returns `"false"`, comparison
-     is `"false" == "false"` => true => PSU_MISSING raised.
+If the field does not exist in the hash for a given key (i.e.,
+`fields.get(field_name)` returns `None`), the condition evaluates to `False`.
+This prevents spurious alarms when a daemon hasn't finished populating all
+fields yet (e.g., psud writes `presence` before `voltage`).
 
-3. **Relational operators** (`<`, `>`, `<=`, `>=`): Attempt `float()`
-   conversion on both sides. If both convert, compare as floats. If either
-   fails, fall back to string comparison.
-   - Example: `current > 230` -- STATE_DB returns `"185.5"`, comparison is
-     `185.5 > 230.0` => false => no alarm.
-   - Example: `voltage < 11.6` -- STATE_DB returns `"11.2"`, comparison is
-     `11.2 < 11.6` => true => PSU_OUTPUT_VOLTAGE_FAULT raised.
+If the owning daemon never writes a key at all — for instance, thermalctld
+crashes on startup and never populates `FAN_INFO` — then
+`table.getKeys()` returns an empty list and alarmd has nothing to iterate
+over. No alarms are raised or cleared for that table. This is intentional:
+alarmd monitors **data that exists in STATE_DB**, not the absence of a
+daemon. Daemon liveness is the responsibility of monit and system-health.
+If a platform needs an alarm for "daemon not writing data," it should use a
+script check that verifies expected keys exist and were recently updated.
+
+#### Operator behavior
+
+- **`==`, `!=`**: Case-sensitive string comparison after whitespace strip.
+  Alarm definitions must match the exact casing the producing daemon writes
+  (e.g., `"True"` vs `"true"` are distinct).
+
+- **`<`, `>`, `<=`, `>=`**: Both operands are converted to `float()`. If
+  both convert successfully, comparison is numeric. If either fails (e.g.,
+  field contains `"N/A"`), falls back to lexicographic string comparison.
+  Numeric comparisons on non-numeric fields are not recommended.
+
+- **Unknown operator**: Returns `False`. Cannot happen in practice because
+  `config.validate()` rejects unknown operators at load time.
+
+Any unexpected exception at any point returns `False` (fail-safe).
 
 ### 7.8 OR-Logic
 
@@ -719,32 +631,29 @@ suppress unwanted common checks.
 
 ### 7.10 Common Alarm Catalog and Platform Merge
 
-**Problem**: A fully-expanded set of alarm definitions for a typical SONiC
-platform can total hundreds of lines. The core PSU and fan checks are
-identical across platforms because the STATE_DB table names and field names
-are standardized by sonic-platform-common.
+Every SONiC platform needs PSU and fan alarm checks, and those checks are
+identical everywhere because sonic-platform-common standardizes the table
+names and field names. Writing the same 10 checks in every platform's
+`alarm_defs.json` would be pointless repetition.
 
-**Solution**: alarmd ships a `common_alarm_defs.json` inside the `sonic_alarm`
-package containing **PSU_INFO and FAN_INFO checks only** (10 checks total —
-see §4 Use Case 1 for the full inventory). Per-platform files declare only
-their platform-specific additions (thermal, PMBus faults, threshold checks,
-scripts, etc.) in an `alarm_tables` array. alarmd automatically merges the
-two at load time.
+So alarmd ships a `common_alarm_defs.json` inside the `sonic_alarm` package
+with those 10 standard PSU_INFO + FAN_INFO checks (see §4 Use Case 1 for
+the full list). Platform files only need to declare what's different —
+additional tables, extra checks, or checks they want to suppress.
 
-**Merge rules** (simple, deterministic):
+At load time, alarmd merges the platform file on top of the common catalog:
 
-1. Start with the common catalog's `alarm_tables` as the baseline.
-2. For each table in the platform file's `alarm_tables`:
-   - If the `table_name` matches a common table, **append** the platform
-     checks to that table. If a platform check has the same `check_name` as
-     a common check, the **platform check replaces** the common one
-     (last-writer-wins).
-   - If the `table_name` does not exist in common, **add** it as a new table.
-3. If the platform file contains a `"disable"` list, remove those checks
+1. The common catalog's `alarm_tables` are the starting point.
+2. For each table in the platform file:
+   - Same `table_name` as a common table → platform checks are appended.
+     If a platform check shares a `check_name` with a common check, the
+     platform version wins (last-writer-wins).
+   - New `table_name` → added as a new table.
+3. If the platform file has a `"disable"` list, those checks are removed
    from the merged result. Format: `["TABLE_NAME.check_name", ...]`.
 
-That's it. No `inherits` keyword, no `override` block, no 5 different
-operations to learn. Platform files just declare what they need.
+The merge is purely additive with an opt-out mechanism. Platform files just
+declare what they need and optionally suppress what they don't.
 
 **Example: platform `alarm_defs.json`** (adds PMBus checks,
 overrides a threshold, disables a check, adds TEMPERATURE_INFO):
@@ -821,9 +730,8 @@ overrides a threshold, disables a check, adds TEMPERATURE_INFO):
 
 **Total: 13 checks** (10 common − 1 disabled + 3 platform + 1 new table).
 
-After merge, the result is a flat list of alarm tables with their checks.
-The merge is resolved at load time; the runtime alarm engine does not
-distinguish between common and platform-declared checks.
+Once merged, the result is a flat list of tables and checks. The runtime
+engine doesn't know or care which checks came from common vs. platform.
 
 For a platform that only needs the common PSU/fan checks, **no
 `alarm_defs.json` is needed at all** — alarmd falls back to the common
@@ -831,8 +739,8 @@ catalog automatically.
 
 ### 7.11 Shorthand Syntax
 
-For platforms that declare checks directly, the shorthand
-syntax reduces each check to a single-line array:
+Alarm tables may use `checks_short` as a compact alternative to the verbose
+`checks` array. Each entry is a three-element array:
 
 ```json
 "checks_short": [
@@ -843,26 +751,14 @@ syntax reduces each check to a single-line array:
 ]
 ```
 
-Format: `[alarm_id, "field operator value", severity]`
+Format: `[alarm_id, "field operator value", severity]`. The condition
+expression is split on the first matching operator token (`==`, `!=`, `<=`,
+`>=`, `<`, `>` — matched longest-first). Each entry expands into a full
+check object with `check_name` defaulting to the alarm_id, `category`
+defaulting to `"Hardware"`, and `description_template` set to
+`"{object_name} <alarm_id>"`.
 
-The `condition_expr` is parsed by splitting on the operator token. Supported
-operators: `==`, `!=`, `<=`, `>=`, `<`, `>` (matched in that order to avoid
-`<` matching `<=`).
-
-Expansion: `["FAN_MISSING", "presence == false", "Major"]` becomes:
-
-```json
-{
-    "check_name": "FAN_MISSING",
-    "alarm_id": "FAN_MISSING",
-    "severity": "Major",
-    "category": "Hardware",
-    "description_template": "{object_name} FAN_MISSING",
-    "condition": {"field": "presence", "operator": "==", "value": "false"}
-}
-```
-
-`checks` and `checks_short` may coexist on the same alarm table; they are
+`checks` and `checks_short` may coexist on the same table; they are
 concatenated after expansion.
 
 ### 7.12 Config Validation
@@ -887,8 +783,8 @@ is advisory and never blocks loading.
 ### 7.13 Hard Limits
 
 The following limits are coded in `constants.py` and have been validated
-through scalability testing.
-Full methodology and raw data are in `tests/stress/STRESS_TEST_RESULTS.md`.
+through scalability testing on a reference platform (x86_64, 8-core Intel
+Xeon D @ 2.2 GHz, 32 GB RAM).
 
 | Constant | Value | Purpose | Evidence |
 |----------|-------|---------|----------|
@@ -907,136 +803,64 @@ Full methodology and raw data are in `tests/stress/STRESS_TEST_RESULTS.md`.
 Combined load is sub-additive (lower than the sum of isolated tests),
 confirming no compounding effects.
 
-### 7.14 Signal Handling
-
-| Signal | Handler behavior |
-|--------|-----------------|
-| `SIGHUP` | Set a reload flag. On the next main-loop iteration, reload alarm definitions from disk. If the new config passes validation, replace the current config and reconfigure StateDBPoller and ScriptRunner. If it fails, log the error and continue with the old config. Active alarms are unaffected. |
-| `SIGTERM` / `SIGINT` | Set the shutdown event. The main loop exits cleanly. ScriptRunner's ThreadPoolExecutor is shut down (running scripts are allowed to complete or killed after timeout). alarmd exits 0. Active alarms remain in STATE_DB. |
-
-### 7.15 Logging and Serviceability
-
-alarmd follows the same logging pattern as `system-health`/`healthd`:
-
-- **Entry point (`scripts/alarmd`)**: The `AlarmDaemon` class extends
-  `DaemonBase` from `sonic_py_common.daemon_base`, which provides
-  `log_info()`, `log_warning()`, `log_error()`, `log_notice()`, and
-  `log_debug()` methods backed by `SysLogger`. The constructor calls
-  `super().__init__(SYSLOG_IDENTIFIER)` and
-  `self.set_min_log_priority_info()`.
-
-- **Helper modules** (`alarm_store.py`, `statedb_poller.py`,
-  `script_runner.py`): Each creates its own module-level `SysLogger`
-  instance with a distinct identifier (`alarmd#store`, `alarmd#poller`,
-  `alarmd#runner`), following the same pattern as
-  `system-health/service_checker.py` (`Logger(log_identifier='service_checker')`)
-  and `system-health/utils.py` (`SysLogger(log_identifier='healthd#utils')`).
-  This gives each module a distinct syslog tag for easy grep filtering.
-
-- **`config.py`**: Uses `logging.getLogger('alarmd')` at module level.
-  Because `DaemonBase`'s `SysLogger` internally calls
-  `logging.getLogger('alarmd')` and attaches a `SysLogHandler` to it,
-  `config.py` inherits that handler automatically through Python's
-  logger-name singleton mechanism. This is safe because `config.py` is
-  only called after `AlarmDaemon.__init__()` has run.
-
-All logging goes to syslog via `/dev/log` with `LOG_DAEMON` facility,
-consistent with every other SONiC platform daemon.
-
-Log levels:
-
-| Event | Level |
-|-------|-------|
-| Alarm raised | WARNING |
-| Alarm cleared | INFO |
-| Config loaded successfully | INFO |
-| Config reload (SIGHUP) | INFO |
-| Config validation failure | ERROR |
-| SONiC version mismatch (alarm_defs vs running image) | WARNING |
-| Script timeout | WARNING |
-| Script modified since config load (mtime change) | WARNING |
-| Script execution error (non-timeout) | ERROR |
-| Daemon startup/shutdown | INFO |
-| evaluate_condition error (type conversion failure) | DEBUG |
-
-Log format example:
-```
-Mar 12 18:45:02.123 sonic-switch WARNING alarmd: RAISE PSU_MISSING on PSU 2 (Critical) - PSU 2 Absent
-Mar 12 18:50:15.456 sonic-switch INFO alarmd: CLEAR PSU_MISSING on PSU 2
-```
-
-For `show techsupport`, alarmd state can be captured by reading
-`SYSTEM_ALARMS` keys from STATE_DB via `redis-cli` or the `show alarms`
-command.
-
-### 7.16 Sequence Diagrams
+### 7.14 Sequence Diagrams
 
 #### Startup Sequence
 
-```
-alarmd                config.py           AlarmStore        StateDBPoller    ScriptRunner
-  |                      |                    |                  |               |
-  |-- acquire_pidfile_lock()                  |                  |               |
-  |   flock(/var/run/alarmd.pid, LOCK_EX|LOCK_NB)               |               |
-  |   [if locked: exit "already running"]     |                  |               |
-  |                      |                    |                  |               |
-  |-- load_alarm_defs()->|                    |                  |               |
-  |                      |-- read files       |                  |               |
-  |                      |-- merge common     |                  |               |
-  |                      |-- expand shorthand |                  |               |
-  |                      |-- validate()       |                  |               |
-  |                      |-- check sonic_version (warn-only)     |               |
-  |<-- alarm_defs -------|                    |                  |               |
-  |                                           |                  |               |
-  |-- clear_on_startup() ------------------->|                  |               |
-  |                                           |-- delete all     |               |
-  |                                           |   SYSTEM_ALARMS  |               |
-  |                                           |   entries         |               |
-  |<- N stale entries cleared ---------------|                  |               |
-  |                                           |                  |               |
-  |== MAIN LOOP START ================================================         |
-  |                                           |                  |               |
-  |-- poll() -------------------------------------------------->|               |
-  |                                           |   for each table:|               |
-  |                                           |   getKeys()      |               |
-  |                                           |   evaluate_cond  |               |
-  |                                           |<- raise/clear ---|               |
-  |                                           |                  |               |
-  |-- run() (if due) -------------------------------------------------->|       |
-  |                                           |                  |       |       |
-  |                                           |                  | submit futures|
-  |                                           |                  |       |       |
-  |                                           |<- raise/clear ------------------|
-  |                                           |                  |               |
-  |-- sleep(statedb_poll_interval) ----       |                  |               |
-  |                                           |                  |               |
-  |== MAIN LOOP REPEAT ===============================================         |
-```
+![Startup Sequence](alarmd_startup_sequence.png)
+
+<!-- Diagram description (for regeneration):
+     UML sequence diagram with 5 participants (vertical lifelines, left to right):
+       alarmd, config.py, AlarmStore, StateDBPoller, ScriptRunner
+
+     Sequence:
+     1. alarmd calls acquire_pidfile_lock() — flock(/var/run/alarmd.pid, LOCK_EX|LOCK_NB).
+        Note: if already locked, exit with "already running".
+     2. alarmd calls config.py: load_alarm_defs()
+        config.py internally: read files → merge common → expand shorthand → validate() → check sonic_version (warn-only)
+        config.py returns alarm_defs to alarmd.
+     3. alarmd calls AlarmStore: clear_on_startup()
+        AlarmStore deletes all SYSTEM_ALARMS entries from STATE_DB.
+        Returns "N stale entries cleared".
+     4. Separator line: "MAIN LOOP START"
+     5. alarmd calls StateDBPoller: poll()
+        StateDBPoller: for each table, getKeys(), evaluate conditions.
+        StateDBPoller calls AlarmStore: raise_alarm() or clear_alarm().
+     6. alarmd calls ScriptRunner: run() (if due)
+        ScriptRunner submits futures to thread pool.
+        ScriptRunner calls AlarmStore: raise_alarm() or clear_alarm().
+     7. alarmd: sleep(statedb_poll_interval)
+     8. Separator line: "MAIN LOOP REPEAT"
+
+     Style: standard UML sequence diagram, white background, black lines, sans-serif font.
+-->
 
 #### SIGHUP Reload Sequence
 
-```
-signal         alarmd              config.py          StateDBPoller   ScriptRunner
-  |               |                    |                   |               |
-  |-- SIGHUP ---->|                    |                   |               |
-  |               |-- set reload_flag  |                   |               |
-  |               |                    |                   |               |
-  |  (next loop iteration)             |                   |               |
-  |               |-- load_alarm_defs->|                   |               |
-  |               |                    |-- read files      |               |
-  |               |                    |-- validate()      |               |
-  |               |                    |                   |               |
-  |         [if valid]                 |                   |               |
-  |               |<-- new alarm_defs -|                   |               |
-  |               |-- reconfigure ---------------------------->|           |
-  |               |-- reconfigure ---------------------------------------->|
-  |               |                                        |               |
-  |         [if invalid]               |                   |               |
-  |               |<-- error ----------|                   |               |
-  |               |-- log error, keep old config           |               |
-```
+![SIGHUP Reload Sequence](alarmd_sighup_sequence.png)
 
-### 7.17 DB and Schema Changes
+<!-- Diagram description (for regeneration):
+     UML sequence diagram with 5 participants: signal, alarmd, config.py, StateDBPoller, ScriptRunner
+
+     Sequence:
+     1. signal sends SIGHUP to alarmd.
+     2. alarmd sets reload_flag internally.
+     3. Note: "next loop iteration"
+     4. alarmd calls config.py: load_alarm_defs()
+        config.py: read files → validate()
+     5. Alt box with two branches:
+        [if valid]:
+          config.py returns new alarm_defs to alarmd.
+          alarmd calls StateDBPoller: reconfigure()
+          alarmd calls ScriptRunner: reconfigure()
+        [if invalid]:
+          config.py returns error to alarmd.
+          alarmd logs error, keeps old config.
+
+     Style: standard UML sequence diagram, white background, black lines, sans-serif font.
+-->
+
+### 7.15 DB and Schema Changes
 
 alarmd introduces one new table in STATE_DB. No changes to CONFIG_DB, APP_DB,
 ASIC_DB, COUNTERS_DB, or LOGLEVEL_DB.
@@ -1067,10 +891,7 @@ SYSTEM_ALARMS|PSU_INPUT_VOLTAGE_FAULT|PSU 1
 SYSTEM_ALARMS|PSU_OUTPUT_VOLTAGE_FAULT|PSU 1
 ```
 
-The table is written exclusively by alarmd. The CLI reads it. No other daemon
-writes to or depends on this table.
-
-### 7.18 Linux Dependencies
+### 7.16 Linux Dependencies
 
 | Dependency | Usage |
 |-----------|-------|
@@ -1086,7 +907,7 @@ writes to or depends on this table.
 
 No additional pip packages are required beyond what SONiC already provides.
 
-### 7.19 Docker Dependency
+### 7.17 Docker Dependency
 
 alarmd runs directly on the host as a systemd service. It requires access to:
 
@@ -1096,7 +917,7 @@ alarmd runs directly on the host as a systemd service. It requires access to:
 - `/usr/share/sonic/device/<platform>/` (alarm definition files)
 - `/etc/sonic/alarm_scripts/` (health check scripts)
 
-### 7.20 Build Dependency
+### 7.18 Build Dependency
 
 alarmd adds the `sonic_alarm` Python package to the sonic-platform-daemons
 build. The `setup.cfg` declares:
@@ -1117,7 +938,7 @@ unit file is installed alongside other platform daemon service files.
 
 No new Debian packages, C/C++ libraries, or external downloads are required.
 
-### 7.21 Platform Dependencies
+### 7.19 Platform Dependencies
 
 alarmd is **platform-independent at the code level**. The daemon binary and
 the `sonic_alarm` Python package are identical across all SONiC platforms.
@@ -1161,9 +982,6 @@ vendor writes an `alarm_defs.json` with its `alarm_tables` and optional
 ## 8. SAI API
 
 No SAI API changes are required. alarmd does not interact with the SAI layer.
-It reads STATE_DB tables that are populated by existing platform daemons
-(which themselves may or may not use SAI). alarmd's data path is entirely
-within the Redis/swsscommon layer.
 
 ---
 
@@ -1256,31 +1074,11 @@ The alarm definition file format is JSON. The top-level structure is:
 ```
 
 **`sonic_version` field**: Declares which SONiC release branch (e.g.
-`"master"`, `"202505"`, `"202605"`) the alarm definitions were authored for.
-At config load time, alarmd reads `/etc/sonic/sonic_version.yml` on the
-running image and compares its `branch` field against the declared
-`sonic_version`. If they differ, alarmd logs a WARNING:
-
-```
-WARNING alarmd: SONIC VERSION MISMATCH: alarm_defs declares sonic_version='202505'
-but running SONiC branch is '202605'. Some alarm checks may reference STATE_DB
-fields or scripts that do not exist on this version, or may miss checks added
-in a newer version.
-```
-
-This is **advisory only** — the config still loads and alarmd runs normally.
-The warning alerts operators and appears in `show techsupport` syslog output.
-
-Use cases:
-- A `202505` alarm_defs file includes a check for a feature bug that was
-  fixed in `202605` — running it on `202605` is unnecessary but harmless;
-  the mismatch warning flags it for cleanup.
-- A `202605` alarm_defs file monitors a new STATE_DB field that doesn't
-  exist in `202505` — the check silently evaluates false (missing field =
-  no alarm), but the version mismatch warning tells the operator why.
-
-If `sonic_version` is omitted from the alarm_defs, the check is skipped.
-If `/etc/sonic/sonic_version.yml` is unreadable, the check is skipped.
+`"master"`, `"202505"`) the alarm definitions were authored for. At config
+load time, alarmd compares it against the running image's branch from
+`/etc/sonic/sonic_version.yml`. A mismatch produces a WARNING in syslog but
+does not block loading. If the field is omitted or the version file is
+unreadable, the check is skipped.
 
 See sections 7.10 and 7.11 for the merge and shorthand formats.
 
@@ -1340,12 +1138,7 @@ Full script check schema:
 
 ---
 
-## 10. Warmboot and Fastboot Design Impact
-
-alarmd is a monitoring-only daemon. It reads STATE_DB, writes to its own
-SYSTEM_ALARMS table, and does not participate in the forwarding pipeline. It
-does not interact with syncd or orchagent and does not hold any state that
-affects packet forwarding.
+## 10. Warmboot and Fastboot Design Impact 
 
 ### Alarm State Across Reboots
 
@@ -1356,19 +1149,21 @@ for any faults that genuinely still exist.
 
 This "clear-and-rediscover" approach is deliberate:
 
-- **Warmboot**: STATE_DB is preserved across warmboot. Without clearing,
-  `SYSTEM_ALARMS` could contain stale entries from before the reboot (e.g.,
-  a PSU alarm that was fixed before the warmboot). Syncing from stale DB
-  entries would present incorrect alarm state to operators and any downstream
-  consumers (SNMP, gNMI).
+- **Warmboot**: The `warm-reboot` script deletes most STATE_DB keys except a
+  specific allowlist (FDB_TABLE, WARM_RESTART_TABLE, MIRROR_SESSION_TABLE,
+  TRANSCEIVER_INFO, etc.). `SYSTEM_ALARMS` is **not** in this allowlist, so
+  it is already wiped by the reboot script before alarmd starts.
+  `clear_on_startup()` is still performed as a defensive measure in case the
+  reboot script's allowlist changes in the future.
 
-- **Cold reboot**: STATE_DB is wiped, so there is nothing to clear. alarmd
-  starts clean and discovers faults on first poll. No difference in behavior.
+- **Cold reboot**: STATE_DB is wiped entirely, so there is nothing to clear.
+  Same end result as warmboot.
 
-- **alarmd-only restart** (`systemctl restart alarmd`): Same as warmboot —
-  any alarms from the previous alarmd run are cleared and re-raised within
-  3 seconds if the fault persists. This avoids duplicate RAISE syslog entries
-  and ensures alarm timestamps reflect the current daemon session.
+- **alarmd-only restart** (`systemctl restart alarmd`): This is the case
+  where `clear_on_startup()` actually matters — STATE_DB is still running and
+  `SYSTEM_ALARMS` entries from the previous alarmd session persist. Clearing
+  and re-raising within 3 seconds ensures no stale alarms linger from a
+  previous config or a fault that was fixed while alarmd was down.
 
 The trade-off is a brief window (≤ `statedb_poll_interval` seconds) after
 startup where `show alarms` returns an empty table even if faults exist. This
@@ -1418,7 +1213,7 @@ Combined load is sub-additive — no compounding effects.
    or cleared); this can be subscribed to via gNMI by a remote collector.
    Historical alarm data (when was an alarm raised and cleared
    over time) is available through syslog but not through a dedicated
-   STATE_DB table. See §14.3 for planned future enhancement.
+   STATE_DB table. See §14.2 for planned future enhancement.
 
 3. **No runtime configuration CLI**: In this initial version, alarm
    definitions are static build-time configuration. To change thresholds or
@@ -1489,19 +1284,25 @@ STATE_DB writes and verifying `SYSTEM_ALARMS` response.
 
 ### 13.3 Scalability and Performance
 
-Completed during scalability testing.
+We stress-tested alarmd on a reference DUT (x86_64, 8-core Intel Xeon D @
+2.2 GHz, 32 GB RAM) to find its limits. Even at configurations far beyond
+what any real platform would use, it stays under 2% CPU and 29 MB RAM.
 
-| What was tested | Result |
-|-----------------|--------|
-| Statedb check scaling (100 → 200 → 500 → 1000) | Linear; 1000 checks: 1.72% CPU, 28.9 MB |
-| Script check scaling (20 → 50 → 100) | 50 checks: 0.35% CPU; truncation guardrail verified at 100→50 |
-| Statedb poll interval floor (1s → 2s → 3s → 5s → 10s) | 2s: 0.46% CPU — safe floor |
-| Script poll interval floor (10s → 20s → 30s → 60s → 120s) | CPU flat ~0.33% across range |
-| Script timeout enforcement (6 cases) | 6/6 passed — scripts exceeding ceiling clamped and killed |
-| **Combined worst-case (200 statedb @ 2s + 50 scripts @ 30s)** | **0.65% CPU, 27.5 MB, 0 errors — sub-additive; no compounding** |
+- **Statedb checks**: scales linearly. 200 checks (our hard limit) = 0.60%
+  CPU. Even at 1000 checks (5× the limit) it's only 1.72% CPU, 28.9 MB.
+  Production runs ~31 checks.
+- **Script checks**: 50 scripts (our hard limit) = 0.35% CPU, negligible
+  memory. Config validation rejects anything over 50.
+- **Poll interval floors**: 2s statedb floor = 0.46% CPU. Below 2s you
+  thrash Redis for no benefit. Script interval is flat across 30–120s.
+- **Timeout enforcement**: 6/6 test cases passed — over-ceiling values
+  clamped at load, over-timeout scripts killed at runtime.
+- **Combined worst-case** (200 statedb @ 2s + 50 scripts @ 30s running
+  simultaneously): 0.65% CPU, 27.5 MB, zero errors. Load is sub-additive —
+  no compounding.
 
-These results informed the hard limits in Section 7.13 and the resource
-envelope in Section 11.
+These results informed the hard limits in §7.13 and the memory envelope in
+§11.
 
 ---
 
